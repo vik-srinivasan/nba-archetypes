@@ -1,0 +1,1157 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+install.packages("FNN")
+
+```
+
+
+# Data Cleaning
+
+##Play Types
+```{r}
+library(readr)
+library(tidyverse)
+
+# Play types DF
+df <- read_csv("~/Documents/Dev Projects/Sports/nba-archetypes-project/data/NBA_Play_Types_16_24.csv")
+
+df <- df %>%
+  mutate(
+    FREQ = as.numeric(FREQ),
+    FREQ_PCTL = as.numeric(FREQ_PCTL),
+    PPP = as.numeric(PPP),
+    PPP_PCTL = as.numeric(PPP_PCTL)
+  )
+```
+
+```{r}
+df_sub <- df %>%
+  select(SEASON, PLAYER_ID, PLAYER_NAME, PLAY_TYPE,
+         FREQ, FREQ_PCTL, PPP, PPP_PCTL)
+head(df_sub)
+```
+
+```{r}
+df_sub_clean <- df_sub %>%
+  group_by(SEASON, PLAYER_ID, PLAYER_NAME, PLAY_TYPE) %>%
+  summarise(
+    FREQ = mean(FREQ, na.rm = TRUE),
+    FREQ_PCTL = mean(FREQ_PCTL, na.rm = TRUE),
+    PPP = mean(PPP, na.rm = TRUE),
+    PPP_PCTL = mean(PPP_PCTL, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# long to wide format
+df_wide <- df_sub_clean %>%
+  pivot_wider(
+    id_cols = c(SEASON, PLAYER_ID, PLAYER_NAME),          
+    names_from = PLAY_TYPE,                               
+    values_from = c(FREQ, FREQ_PCTL, PPP, PPP_PCTL),      
+    names_glue = "{PLAY_TYPE}_{.value}"                   
+  )
+tail(df_wide, 100)
+
+```
+
+##BBall Ref
+```{r}
+# Read the CSV exported from Python
+df_stats <- read_csv("~/Documents/Dev Projects/Sports/nba-archetypes-project/all_players_seasons.csv")
+```
+
+```{r}
+df_stats <- df_stats %>%
+  rename(
+    PLAYER_NAME = Player,  # match df_wide column
+    SEASON = Season
+  )
+
+head(df_stats)
+```
+
+```{r}
+df_merged <- df_wide %>%
+  left_join(df_stats, by = c("PLAYER_NAME", "SEASON"))
+tail(df_merged, 100)
+```
+
+```{r}
+colnames(df_merged)
+```
+
+```{r}
+df_merged_clean <- df_merged %>%
+  select(-c(
+    "Cut_FREQ_PCTL", "Misc_FREQ_PCTL", "PnR Roll Man_FREQ_PCTL", "Postup_FREQ_PCTL",
+    "Spotup_FREQ_PCTL", "Transition_FREQ_PCTL", "Handoff_FREQ_PCTL", "Isolation_FREQ_PCTL",
+    "Off Screens_FREQ_PCTL", "PnR Ball-Handler_FREQ_PCTL", "Putbacks_FREQ_PCTL",
+    "Cut_PPP_PCTL", "Misc_PPP_PCTL", "PnR Roll Man_PPP_PCTL", "Postup_PPP_PCTL",
+    "Spotup_PPP_PCTL", "Transition_PPP_PCTL", "Handoff_PPP_PCTL", "Isolation_PPP_PCTL",
+    "Off Screens_PPP_PCTL", "PnR Ball-Handler_PPP_PCTL", "Putbacks_PPP_PCTL",
+    "TRB%", "G"
+  ))
+colnames(df_merged_clean)
+```
+
+
+
+# K-Means
+```{r}
+library(dplyr)
+
+# Select only numeric columns to cluster on
+df_numeric <- df_merged_clean %>%
+  select(where(is.numeric)) %>%
+  select(-PLAYER_ID)  # remove identifier columns if needed
+
+# Save player-season info to merge back later
+player_info <- df_merged_clean %>%
+  select(SEASON, PLAYER_NAME, PLAYER_ID)
+
+# If NA, use mean of that column (Mess with this !!)
+df_numeric_clean <- df_numeric %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.), ., mean(., na.rm = TRUE))))
+
+# Normalize the numeric values
+df_scaled <- scale(df_numeric_clean)
+```
+
+```{r}
+set.seed(42)
+k <- 8
+kmeans_result <- kmeans(df_scaled, centers = k, nstart = 25, iter.max = 100)
+```
+
+```{r}
+df_archetypes <- bind_cols(player_info, as.data.frame(df_scaled)) %>%
+  mutate(Archetype = as.factor(kmeans_result$cluster))
+```
+
+```{r}
+df_archetypes %>%
+  count(Archetype) %>%
+  arrange(desc(n))
+```
+```{r}
+df_archetypes %>%
+  select(SEASON, PLAYER_NAME, Archetype) %>%
+  arrange(Archetype, SEASON, PLAYER_NAME)
+
+```
+
+```{r}
+df_archetypes %>%
+  group_by(Archetype) %>%
+  summarise(Players = paste0(unique(PLAYER_NAME), collapse = ", "), .groups = "drop")
+
+```
+
+
+```{r}
+library(Rtsne)
+
+# Run t-SNE on the scaled data (you may want to set a smaller `perplexity` if data is small)
+set.seed(42)
+tsne_result <- Rtsne(df_scaled, dims = 2, perplexity = 30)
+
+# Build dataframe for plotting
+tsne_df <- as.data.frame(tsne_result$Y) %>%
+  setNames(c("D1", "D2")) %>%
+  bind_cols(player_info) %>%
+  mutate(Archetype = as.factor(kmeans_result$cluster))
+
+# Plot
+ggplot(tsne_df, aes(x = Dim1, y = Dim2, color = Archetype)) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(title = "t-SNE Projection of NBA Player Archetypes") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+```
+
+```{r}
+# Run PCA on the scaled features
+pca_result <- prcomp(df_scaled, center = TRUE, scale. = TRUE)
+
+# Combine PCA output with player info and archetypes
+pca_df <- as.data.frame(pca_result$x[, 1:2]) %>%  # Take first 2 PCs
+  bind_cols(player_info) %>%
+  mutate(Archetype = as.factor(kmeans_result$cluster))
+
+# Plot PCA
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Archetype)) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(
+    title = "PCA Projection of NBA Player Archetypes",
+    x = "Principal Component 1",
+    y = "Principal Component 2"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+```
+
+```{r}
+library(dplyr)
+
+top5_by_cluster_pts_kmeans <- df_archetypes %>%
+  left_join(df_merged_clean %>%
+              select(SEASON, PLAYER_NAME, PTS),
+            by = c("SEASON", "PLAYER_NAME")) %>%
+  filter(SEASON == "2023-24") %>%
+  group_by(Archetype) %>%
+  slice_max(order_by = PTS, n = 10) %>%
+  ungroup() %>%
+  arrange(Archetype, desc(PTS)) %>%
+  select(SEASON, PLAYER_NAME, Archetype)
+
+top5_by_cluster_pts_kmeans
+```
+
+
+## Finding Most Similar Players
+
+```{r}
+df_with_scaled <- bind_cols(
+  df_archetypes %>% select(PLAYER_NAME, SEASON, Archetype),
+  as.data.frame(df_scaled)
+)
+```
+
+```{r}
+library(FNN)
+
+find_similar_players <- function(player_name, season, df_with_scaled, df_scaled, k = 5) {
+  # Step 1: Locate the target row
+  target_row <- df_with_scaled %>%
+    filter(PLAYER_NAME == player_name, SEASON == season)
+  
+  if (nrow(target_row) != 1) {
+    stop("Player-season not found or not unique.")
+  }
+  
+  # Step 2: Get target's archetype
+  target_archetype <- target_row$Archetype
+  
+  # Step 3: Subset to same archetype
+  df_same_archetype <- df_with_scaled %>%
+    filter(Archetype == target_archetype)
+  
+  # Extract feature columns from same-archetype set
+  features_same_archetype <- df_same_archetype %>%
+    select(-PLAYER_NAME, -SEASON, -Archetype)
+  
+  # Extract feature columns for the target player
+  target_features <- target_row %>%
+    select(-PLAYER_NAME, -SEASON, -Archetype)
+  
+  # Step 4: Run KNN (k+1 to include target themselves)
+  knn_result <- get.knnx(
+    data = features_same_archetype,
+    query = target_features,
+    k = k + 1
+  )
+  
+  # Step 5: Extract neighbors, remove self if present
+  neighbor_indices <- knn_result$nn.index[1,]
+  neighbors <- df_same_archetype[neighbor_indices, ]
+  
+  # Remove the query player-season from the output
+  neighbors <- neighbors %>%
+    filter(!(PLAYER_NAME == player_name & SEASON == season)) %>%
+    head(k)  # ensure only k others are returned
+  
+  return(neighbors)
+}
+```
+
+```{r}
+name = "Duncan Robinson"
+season = "2020-21"
+n = 10
+
+find_similar_players(name, season, df_with_scaled, df_scaled, k = n)
+```
+
+
+
+
+# Seeded K-Means
+## Model
+To try to get better clusters/ archetypes, I propose a seeded k-means method where I create 9 archetypes, and run a semi-supervised k-means algorithm, with 10 players already put into each cluster.
+
+```{r}
+library(dplyr)
+library(FNN)
+
+# Step 1: Seed player-season definitions
+seeds <- tribble(
+  ~PLAYER_NAME, ~SEASON, ~ARCHETYPE,
+  
+  # Post Scorer
+  "Nikola Jokić", "2022-23", "Post Scorer",
+  "Nikola Jokić", "2020-21", "Post Scorer",
+  "Domantas Sabonis", "2023-24", "Post Scorer",
+  "Domantas Sabonis", "2021-22", "Post Scorer",
+  "Joel Embiid", "2021-22", "Post Scorer",
+  "Joel Embiid", "2023-24", "Post Scorer",
+  "Nikola Vucevic", "2019-20", "Post Scorer",
+  "DeMarcus Cousins", "2016-17", "Post Scorer",
+  "Karl-Anthony Towns", "2019-20", "Post Scorer",
+  "LaMarcus Aldridge", "2018-19", "Post Scorer",
+
+  # Stretch Big
+  "Karl-Anthony Towns", "2023-24", "Stretch Big",
+  "Brook Lopez", "2020-21", "Stretch Big",
+  "Myles Turner", "2023-24", "Stretch Big",
+  "Kevin Love", "2016-17", "Stretch Big",
+  "Nemanja Bjelica", "2018-19", "Stretch Big",
+  "Naz Reid", "2023-24", "Stretch Big",
+  "Al Horford", "2023-24", "Stretch Big",
+  "Chet Holmgren", "2023-24", "Stretch Big",
+  "Wendell Carter Jr.", "2022-23", "Stretch Big",
+  "Kristaps Porzingis", "2023-24", "Stretch Big",
+
+  # Roll & Cut Big
+  "Rudy Gobert", "2016-17", "Roll & Cut Big",
+  "Jarrett Allen", "2023-24", "Roll & Cut Big",
+  "Nic Claxton", "2022-23", "Roll & Cut Big",
+  "Clint Capela", "2022-23", "Roll & Cut Big",
+  "Hassan Whiteside", "2019-20", "Roll & Cut Big",
+  "Derrick Favors", "2018-19", "Roll & Cut Big",
+  "Steven Adams", "2015-16", "Roll & Cut Big",
+  "Daniel Gafford", "2023-24", "Roll & Cut Big",
+  "Onyeka Okongwu", "2023-24", "Roll & Cut Big",
+  "Kevon Looney", "2021-22", "Roll & Cut Big",
+
+  # Shot Creator
+  "Russell Westbrook", "2016-17", "Shot Creator",
+  "Shai Gilgeous-Alexander", "2023-24", "Shot Creator",
+  "Giannis Antetokounmpo", "2017-18", "Shot Creator",
+  "Luka Doncic", "2023-24", "Shot Creator",
+  "Kevin Durant", "2021-22", "Shot Creator",
+  "Paul George", "2016-17", "Shot Creator",
+  "Anthony Edwards", "2021-22", "Shot Creator",
+  "Andrew Wiggins", "2017-18", "Shot Creator",
+  "Brandon Ingram", "2021-22", "Shot Creator",
+  "Kobe Bryant", "2015-16", "Shot Creator",
+
+  # Primary Ball-Handler
+  "Kyle Lowry", "2017-18", "Primary Ball-Handler",
+  "Tyrese Haliburton", "2021-22", "Primary Ball-Handler",
+  "Chris Paul", "2022-23", "Primary Ball-Handler",
+  "Kemba Walker", "2017-18", "Primary Ball-Handler",
+  "Eric Bledsoe", "2018-19", "Primary Ball-Handler",
+  "Ricky Rubio", "2017-18", "Primary Ball-Handler",
+  "Darius Garland", "2022-23", "Primary Ball-Handler",
+  "George Hill", "2015-16", "Primary Ball-Handler",
+  "Josh Giddey", "2023-24", "Primary Ball-Handler",
+  "Malcolm Brogdon", "2017-18", "Primary Ball-Handler",
+
+  # Slasher
+  "De'Aaron Fox", "2018-19", "Slasher",
+  "John Wall", "2017-18", "Slasher",
+  "Collin Sexton", "2018-19", "Slasher",
+  "Jalen Williams", "2022-23", "Slasher",
+  "Jonathon Simmons", "2017-18", "Slasher",
+  "Elfrid Payton", "2020-21", "Slasher",
+  "Emmanuel Mudiay", "2018-19", "Slasher",
+  "Markelle Fultz", "2023-24", "Slasher",
+  "Delon Wright", "2017-18", "Slasher",
+  "RJ Barrett", "2021-22", "Slasher",
+
+  # Finisher
+  "Michael Kidd-Gilchrist", "2016-17", "Finisher",
+  "Aaron Gordon", "2016-17", "Finisher",
+  "Herbert Jones", "2021-22", "Finisher",
+  "Christian Braun", "2022-23", "Finisher",
+  "Pascal Siakam", "2017-18", "Finisher",
+  "Hamidou Diallo", "2022-23", "Finisher",
+  "Bruce Brown", "2020-21", "Finisher",
+  "Kyle Anderson", "2016-17", "Finisher",
+  "Ausar Thompson", "2023-24", "Finisher",
+  "Tari Eason", "2022-23", "Finisher",
+
+  # Movement Shooter
+  "JJ Redick", "2016-17", "Movement Shooter",
+  "Klay Thompson", "2017-18", "Movement Shooter",
+  "Kyle Korver", "2017-18", "Movement Shooter",
+  "Duncan Robinson", "2020-21", "Movement Shooter",
+  "Buddy Hield", "2022-23", "Movement Shooter",
+  "Sam Hauser", "2023-24", "Movement Shooter",
+  "Max Strus", "2022-23", "Movement Shooter",
+  "Joe Harris", "2020-21", "Movement Shooter",
+  "Marco Belinelli", "2017-18", "Movement Shooter",
+  "Kentavious Caldwell-Pope", "2018-19", "Movement Shooter",
+
+  # Stationary Shooter
+  "Channing Frye", "2016-17", "Stationary Shooter",
+  "P.J. Tucker", "2019-20", "Stationary Shooter",
+  "Nicolas Batum", "2020-21", "Stationary Shooter",
+  "Otto Porter Jr.", "2021-22", "Stationary Shooter",
+  "Dorian Finney-Smith", "2021-22", "Stationary Shooter",
+  "Trevor Ariza", "2017-18", "Stationary Shooter",
+  "Danuel House Jr.", "2019-20", "Stationary Shooter",
+  "Jae Crowder", "2018-19", "Stationary Shooter",
+  "Grant Williams", "2022-23", "Stationary Shooter",
+  "John Konchar", "2022-23", "Stationary Shooter",
+
+  # 2-Level Playmaker
+  "Alex Caruso", "2023-24", "2-Level Playmaker",
+  "Tobias Harris", "2019-20", "2-Level Playmaker",
+  "OG Anunoby", "2017-18", "2-Level Playmaker",
+  "Bogdan Bogdanovic", "2019-20", "2-Level Playmaker",
+  "Patrick Beverly", "2019-20", "2-Level Playmaker",
+  "Marcus Smart", "2018-19", "2-Level Playmaker",
+  "Keldon Johnson", "2022-23", "2-Level Playmaker",
+  "Will Barton", "2017-18", "2-Level Playmaker",
+  "Kelly Oubre", "2023-24", "2-Level Playmaker",
+  "Luguentz Dort", "2020-21", "2-Level Playmaker"
+)
+
+df_with_scaled_mutated <- df_with_scaled %>%
+  mutate(
+    `ORB%` = `ORB%` * 1.5,
+    `Postup_FREQ` = `Postup_FREQ` * 1.5,
+    `3P%FGA` = `3P%FGA` * 1.5
+  )
+
+# Step 2: Join with scaled features
+seed_features <- df_with_scaled_mutated %>%
+  inner_join(seeds, by = c("PLAYER_NAME", "SEASON"))
+
+# Step 3: Compute mean vector for each archetype
+initial_centers <- seed_features %>%
+  group_by(ARCHETYPE) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop")
+
+# Step 4: Run seeded k-means
+set.seed(38)
+kmeans_seeded <- kmeans(
+  x = df_with_scaled_mutated %>% select(where(is.numeric)),
+  centers = as.matrix(initial_centers %>% select(-ARCHETYPE)),
+  iter.max = 50, nstart = 1
+)
+
+# Step 5: Add cluster assignments back
+df_with_clusters <- df_with_scaled_mutated %>%
+  mutate(Cluster = kmeans_seeded$cluster)
+
+```
+
+```{r}
+df_with_clusters_named %>%
+  count(ARCHETYPE, Cluster) %>%
+  arrange(Cluster)
+```
+
+## Top 10 per Cluster
+```{r}
+library(purrr)
+
+# Step 1: Get seed player identifiers
+seed_keys <- seeds %>% select(PLAYER_NAME, SEASON)
+
+# Step 2: Compute distance to assigned cluster center
+centers <- kmeans_seeded$centers
+features_only <- df_with_scaled_mutated %>% select(where(is.numeric))
+
+distances <- map_dbl(1:nrow(features_only), function(i) {
+  clust <- kmeans_seeded$cluster[i]
+  sum((features_only[i, ] - centers[clust, ])^2)
+})
+
+# Step 3: Add cluster + distance
+df_with_clusters <- df_with_clusters %>%
+  mutate(DistanceToCenter = distances)
+
+# Step 4: Map Cluster number to archetype name
+# Use the mapping from initial_centers
+cluster_map <- initial_centers %>%
+  mutate(Cluster = 1:n()) %>%
+  select(Cluster, ARCHETYPE)
+
+df_with_clusters_named <- df_with_clusters %>%
+  left_join(cluster_map, by = "Cluster")
+
+# Step 5: Filter out seed players
+df_nonseeds <- df_with_clusters_named %>%
+  anti_join(seed_keys, by = c("PLAYER_NAME", "SEASON"))
+
+# Step 6: Get top 10 closest players per cluster
+top10_by_cluster <- df_nonseeds %>%
+  group_by(Cluster, ARCHETYPE) %>%
+  slice_min(order_by = DistanceToCenter, n = 10) %>%
+  arrange(Cluster, DistanceToCenter) %>%
+  select(Cluster, ARCHETYPE, PLAYER_NAME, SEASON, DistanceToCenter)
+
+# View the result
+print(top10_by_cluster, n = 100)
+```
+
+```{r}
+# Step 1: Join raw PTS back into clustered data
+df_with_clusters_named_pts <- df_with_clusters_named %>%
+  left_join(
+    df_merged_clean %>% select(PLAYER_NAME, SEASON, PTS_raw = PTS),
+    by = c("PLAYER_NAME", "SEASON")
+  )
+
+# Step 2: Use PTS_raw to filter and display top 10 scoring archetypes
+top10_scoring_representatives <- df_with_clusters_named_pts %>%
+  filter(PTS_raw > 5) %>%
+  group_by(ARCHETYPE) %>%
+  slice_min(order_by = DistanceToCenter, n = 20) %>%
+  arrange(ARCHETYPE, DistanceToCenter) %>%
+  select(ARCHETYPE, PLAYER_NAME, SEASON, PTS_raw, DistanceToCenter)
+
+print(top10_scoring_representatives, n = 100)
+```
+
+```{r}
+# Step 1: Join raw PTS back into clustered data
+df_with_clusters_named_pts <- df_with_clusters_named %>%
+  left_join(
+    df_merged_clean %>%
+      select(PLAYER_NAME, SEASON, PTS_raw = PTS),
+    by = c("PLAYER_NAME", "SEASON")
+  )
+
+# Step 2: Filter for 2023–24 and get top 10 scorers per archetype
+top10_scorers_per_cluster <- df_with_clusters_named_pts %>%
+  filter(SEASON == "2023-24") %>%
+  filter(!is.na(PTS_raw)) %>%
+  group_by(ARCHETYPE) %>%
+  slice_max(order_by = PTS_raw, n = 20, with_ties = FALSE) %>%
+  arrange(ARCHETYPE, desc(PTS_raw)) %>%
+  select(ARCHETYPE, PLAYER_NAME, SEASON, PTS_raw)
+
+# View the result
+print(top10_scorers_per_cluster, n = 100)
+```
+
+
+## Accuracy on left-out players
+
+```{r}
+# Step 1: Build test set with true labels
+test_set <- tribble(
+  ~PLAYER_NAME, ~SEASON, ~TRUE_ARCHETYPE,
+  "Julius Randle", "2019-20", "Post Scorer",
+  "Domantas Sabonis", "2022-23", "Post Scorer",
+  "Joel Embiid", "2022-23", "Post Scorer",
+  "DeMarcus Cousins", "2017-18", "Post Scorer",
+  "Alperen Sengun", "2023-24", "Post Scorer",
+
+  "Brook Lopez", "2019-20", "Stretch Big",
+  "Myles Turner", "2023-24", "Stretch Big",
+  "Kevin Love", "2017-18", "Stretch Big",
+  "Bobby Portis", "2018-19", "Stretch Big",
+  "John Collins", "2020-21", "Stretch Big",
+
+  "Rudy Gobert", "2021-22", "Roll & Cut Big",
+  "Clint Capela", "2017-18", "Roll & Cut Big",
+  "Steven Adams", "2020-21", "Roll & Cut Big",
+  "Ian Mahinmi", "2015-16", "Roll & Cut Big",
+  "Dereck Lively II", "2023-24", "Roll & Cut Big",
+
+  "James Harden", "2018-19", "Shot Creator",
+  "LeBron James", "2017-18", "Shot Creator",
+  "Zach LaVine", "2021-22", "Shot Creator",
+  "Paolo Banchero", "2023-24", "Shot Creator",
+  "Kawhi Leonard", "2018-19", "Shot Creator",
+
+  "Kyle Lowry", "2018-19", "Primary Ball-Handler",
+  "Tyrese Haliburton", "2020-21", "Primary Ball-Handler",
+  "Jeremy Lin", "2016-17", "Primary Ball-Handler",
+  "Mike Conley", "2021-22", "Primary Ball-Handler",
+  "Reggie Jackson", "2017-18", "Primary Ball-Handler",
+
+  "Aaron Holiday", "2021-22", "Slasher",
+  "Markelle Fultz", "2019-20", "Slasher",
+  "Dante Exum", "2017-18", "Slasher",
+  "Michael Carter-Williams", "2015-16", "Slasher",
+  "Dennis Smith Jr.", "2022-23", "Slasher",
+
+  "Jaylen Brown", "2016-17", "Finisher",
+  "Hamidou Diallo", "2019-20", "Finisher",
+  "Jarred Vanderbilt", "2021-22", "Finisher",
+  "Tony Allen", "2015-16", "Finisher",
+  "Precious Achiuwa", "2022-23", "Finisher",
+
+  "JJ Redick", "2017-18", "Movement Shooter",
+  "Klay Thompson", "2021-22", "Movement Shooter",
+  "Kyle Korver", "2016-17", "Movement Shooter",
+  "Wesley Matthews", "2017-18", "Movement Shooter",
+  "Joe Harris", "2017-18", "Movement Shooter",
+
+  "P.J. Tucker", "2017-18", "Stationary Shooter",
+  "Nicolas Batum", "2021-22", "Stationary Shooter",
+  "Dorian Finney-Smith", "2022-23", "Stationary Shooter",
+  "Royce O'Neale", "2020-21", "Stationary Shooter",
+  "Dean Wade", "2023-24", "Stationary Shooter",
+  
+  "Andrew Wiggins", "2023-24", "2-Level Playmaker",
+  "Bojan Bogdanovic", "2022-23", "2-Level Playmaker",
+  "RJ Barrett", "2023-24", "2-Level Playmaker",
+  "Jaylen Brown", "2017-18", "2-Level Playmaker",
+  "Rui Hachimura", "2019-20", "2-Level Playmaker"
+)
+
+# Step 2: Merge with clustering results
+test_predictions <- test_set %>%
+  left_join(df_with_clusters_named %>%
+              select(PLAYER_NAME, SEASON, Cluster, PREDICTED_ARCHETYPE = ARCHETYPE),
+            by = c("PLAYER_NAME", "SEASON"))
+
+# Step 3: Compute overall accuracy
+overall_accuracy <- mean(test_predictions$TRUE_ARCHETYPE == test_predictions$PREDICTED_ARCHETYPE)
+cat("✅ Overall Accuracy:", round(overall_accuracy * 100, 1), "%\n\n")
+
+# Step 4: Compute accuracy per archetype
+accuracy_by_archetype <- test_predictions %>%
+  group_by(TRUE_ARCHETYPE) %>%
+  summarise(
+    correct = sum(TRUE_ARCHETYPE == PREDICTED_ARCHETYPE),
+    total = n(),
+    accuracy = round(100 * correct / total, 1),
+    .groups = "drop"
+  )
+
+print(accuracy_by_archetype)
+
+# Step 5: Print all test predictions (for inspection)
+test_predictions %>%
+  select(PLAYER_NAME, SEASON, TRUE_ARCHETYPE, PREDICTED_ARCHETYPE)
+```
+
+## Summary of a Player
+```{r}
+find_archetype_and_similar_players <- function(player_name, season, df_with_clusters_named, k = 10) {
+  # Step 1: Get the target player row
+  target_row <- df_with_clusters_named %>%
+    filter(PLAYER_NAME == player_name, SEASON == season)
+
+  if (nrow(target_row) != 1) {
+    stop("Player-season not found or not unique.")
+  }
+
+  target_cluster <- target_row$Cluster
+  target_archetype <- target_row$ARCHETYPE
+
+  # Step 2: Get all players in same archetype (same cluster)
+  same_archetype_df <- df_with_clusters_named %>%
+    filter(Cluster == target_cluster)
+
+  # Step 3: Compute similarity (Euclidean distance) to all others
+  target_vec <- target_row %>%
+    select(where(is.numeric)) %>%
+    select(-Cluster, -DistanceToCenter)
+
+  feature_matrix <- same_archetype_df %>%
+    select(where(is.numeric)) %>%
+    select(-Cluster, -DistanceToCenter)
+
+  # Step 4: Use FNN to get neighbors
+  knn_result <- get.knnx(
+    data = feature_matrix,
+    query = as.matrix(target_vec),
+    k = k + 1  # include self
+  )
+
+  neighbor_indices <- knn_result$nn.index[1, ]
+  neighbors <- same_archetype_df[neighbor_indices, ] %>%
+    filter(!(PLAYER_NAME == player_name & SEASON == season)) %>%
+    slice_head(n = k) %>%
+    select(PLAYER_NAME, SEASON, ARCHETYPE, DistanceToCenter)
+
+  cat(glue::glue("Player {player_name} ({season}) is a '{target_archetype}' archetype.\n\n"))
+  return(neighbors)
+}
+```
+```{r}
+library(dplyr)
+# See Cluster Overlap
+get_cluster_similarity <- function(player_name, season, df_with_scaled, initial_centers, archetype_names) {
+  # 1. Get player's standardized stats
+  player_row <- df_with_scaled_mutated %>%
+    filter(PLAYER_NAME == player_name, SEASON == season) %>%
+    select(where(is.numeric))
+  
+  if (nrow(player_row) != 1) stop("Player-season not found or not unique.")
+  
+  # 2. Compute Euclidean distance from each cluster centroid
+  distances <- apply(initial_centers %>% select(where(is.numeric)), 1, function(center) {
+    sqrt(sum((player_row - center)^2))
+  })
+  
+  # 3. Convert distances to similarity (inverse distance)
+  max_dist <- max(distances)
+  similarity <- (max_dist - distances) / max_dist
+  
+  # 4. Normalize to percentage
+  similarity_pct <- similarity / sum(similarity) * 100
+  
+  # 5. Return as a tibble
+  tibble(
+    ARCHETYPE = archetype_names,
+    SimilarityPercent = round(similarity_pct, 1)
+  ) %>% arrange(desc(SimilarityPercent))
+}
+```
+```{r}
+get_player_archetype_history <- function(player_name, df_clustered) {
+  df_clustered %>%
+    filter(PLAYER_NAME == player_name) %>%
+    arrange(SEASON) %>%
+    select(PLAYER_NAME, SEASON, ARCHETYPE)
+}
+```
+ 
+Enter Players Name:
+```{r}
+name = "Luka Doncic"
+year = "2022-23"
+```
+
+```{r}
+find_archetype_and_similar_players(name, year, df_with_clusters_named, k = 25)
+```
+```{r}
+get_player_archetype_history(name, df_with_clusters_named)
+```
+```{r}
+archetype_names <- initial_centers$ARCHETYPE
+get_cluster_similarity(name, year, df_with_scaled_mutated, initial_centers, archetype_names)
+```
+
+## Plot Stats by Cluster
+```{r}
+# Step 1: Merge cluster labels with unscaled stats
+df_clustered_merged_1 <- df_with_clusters_named %>%
+  left_join(df_merged_clean %>%
+              select(PLAYER_NAME, SEASON,
+                     "PTS", "USG%",
+                     "3P%FGA", "CORNER%3PA", "DUNK%FGA",
+                     "Isolation_FREQ", "Spotup_FREQ"),
+            by = c("PLAYER_NAME", "SEASON"))
+
+# Step 2: Cluster averages for selected variables
+cluster_summary_1 <- df_clustered_merged_1 %>%
+  group_by(ARCHETYPE) %>%
+  summarise(
+    across(c("PTS.x", "USG%.x", "3P%FGA.x",
+             "CORNER%3PA.x", "DUNK%FGA.x", "Isolation_FREQ.x", "Spotup_FREQ.x"),
+           mean, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Step 3: Reshape and rename stats for plotting
+cluster_long_2 <- cluster_summary_1 %>%
+  pivot_longer(-ARCHETYPE, names_to = "Stat", values_to = "Mean") %>%
+    mutate(
+      Stat = recode(Stat,
+        "PTS.x" = "Points",
+        "USG%.x" = "Usage Rate",
+        "3P%FGA.x" = "Three-Pointer Frequency",
+        "CORNER%3PA.x" = "Corner Three-Pointer Frequency",
+        "DUNK%FGA.x" = "Dunk Frequency",
+        "Isolation_FREQ.x" = "Isolation Frequency",
+        "Spotup_FREQ.x" = "Spotup Frequency"
+      )
+    )
+```
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# Step 4: Plot (Zoomed Out + Gridlines)
+ggplot(cluster_long_2, aes(x = Mean, y = Stat, color = ARCHETYPE)) +
+  geom_point(size = 3) +
+  scale_color_viridis_d(option = "H") + 
+  labs(
+    title = "How Each Cluster Compares",
+    x = "Cluster Average",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major.y = element_line(color = "grey80"),
+    panel.grid.major.x = element_line(color = "grey90"),
+    legend.position = "right",  # Move legend to the right
+    plot.margin = margin(10, 20, 10, 20),
+    axis.text.y = element_text(size = 8)
+  )
+
+```
+
+## Minimum Spanning Tree (2023-24)
+
+```{r}
+library(dplyr)
+library(igraph)
+library(tibble)
+library(RColorBrewer)
+
+# Step 1: Filter top players (excluding problematic names)
+top_players <- df_with_clusters_named_pts %>%
+  filter(SEASON == "2023-24") %>%
+  filter(!(PLAYER_NAME %in% c(
+    "Jerami Grant", "Miles Bridges", "Chet Holmgren", "RJ Barrett",
+    "Malaki Branham", "Lonnie Walker IV", "Franz Wagner", "Mikal Bridges",
+    "Jalen Green", "Zach LaVine", "Devin Vassell", "Tyler Herro",
+    "Dalano Banton", "Andrew Nembhard", "De'Andre Hunter"
+  ))) %>%
+  group_by(ARCHETYPE) %>%
+  slice_max(order_by = PTS_raw, n = 25) %>%
+  ungroup() %>%
+  select(PLAYER_NAME, SEASON, ARCHETYPE, DistanceToCenter, PTS_raw)
+
+# Step 2: Scaled feature matrix for selected players
+player_features <- df_with_scaled_mutated %>%
+  semi_join(top_players, by = c("PLAYER_NAME", "SEASON")) %>%
+  select(PLAYER_NAME, where(is.numeric)) %>%
+  column_to_rownames("PLAYER_NAME")
+
+# Step 3: Pairwise distances and edges
+dist_matrix <- dist(player_features)
+edges <- as.data.frame(as.table(as.matrix(dist_matrix))) %>%
+  filter(Var1 != Var2) %>%
+  rename(from = Var1, to = Var2, weight = Freq) %>%
+  rowwise() %>%
+  mutate(pair = paste(sort(c(from, to)), collapse = "_")) %>%
+  distinct(pair, .keep_all = TRUE) %>%
+  select(from, to, weight)
+
+# Step 4: Node metadata
+nodes <- top_players %>%
+  filter(PLAYER_NAME %in% unique(c(edges$from, edges$to))) %>%
+  distinct(PLAYER_NAME, ARCHETYPE) %>%
+  rename(name = PLAYER_NAME, group = ARCHETYPE)
+
+# Step 5: Build graph and MST
+g <- graph_from_data_frame(edges, vertices = nodes, directed = FALSE)
+mst <- mst(g, weights = E(g)$weight)
+
+# Step 6: Build layout
+set.seed(42)
+layout <- layout_with_kk(mst)  # or layout_with_kk(mst)
+layout <- layout * 16
+
+# Step 7: Build label vector: only top scorer per archetype
+top_labeled <- top_players %>%
+  group_by(ARCHETYPE) %>%
+  arrange(desc(PTS_raw)) %>%
+  filter(row_number() %in% c(1, 3)) %>%
+  pull(PLAYER_NAME)
+
+# Highlight vertex frame for labeled players
+V(mst)$frame.color <- ifelse(
+  V(mst)$name %in% top_labeled,
+  "firebrick",       # highlight labeled players with a black border
+  NA             # default (invisible) border
+)
+V(mst)$label <- ifelse(V(mst)$name %in% top_labeled, V(mst)$name, NA)
+
+# Step 8: Color palette for clusters
+n_clusters <- length(unique(V(mst)$group))
+cluster_colors <- colorRampPalette(brewer.pal(8, "Dark2"))(n_clusters)
+vertex_colors <- cluster_colors[as.numeric(as.factor(V(mst)$group))]
+
+par(mar = c(0, 0, 1, 0), family = "Tahoma")
+# Step 9: Plot MST
+plot(
+  mst,
+  layout = layout,
+  main = "2023–24 NBA Archetype MST",
+  vertex.label = V(mst)$label,
+  vertex.label.cex = 0.6,   # Adjust font size of labels
+  vertex.label.color = "black",
+  vertex.label.dist = 1.1,
+  #vertex.label.degree = runif(vcount(mst), 0, pi),
+  # Adjust distance of labels from vertices (lower for closer to center)
+  #vertex.label.family = "sans",  # Font family for labels
+  vertex.size = 5,         # Increase vertex size for better visibility
+  edge.width = 4,           # Increase edge width for better visibility
+  edge.color = adjustcolor("gray60", alpha.f = 0.7),
+  vertex.color = vertex_colors
+)
+
+# Add legend for clusters
+legend("bottomleft",
+       legend = levels(as.factor(V(mst)$group)),
+       fill = cluster_colors,
+       title = "Archetype",
+       cex = 0.8,
+       bty = "n")
+
+```
+
+## Past NBA Champions:
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Define the lineups for each team
+championship_lineups <- tribble(
+  ~TEAM, ~PLAYER_NAME, ~SEASON,
+  
+  # 2024 Celtics
+  "24 Celtics", "Al Horford", "2023-24",
+  "24 Celtics", "Jrue Holiday", "2023-24",
+  "24 Celtics", "Jayson Tatum", "2023-24",
+  "24 Celtics", "Jaylen Brown", "2023-24",
+  "24 Celtics", "Derrick White", "2023-24",
+  
+  # 2023 Nuggets
+  "23 Nuggets", "Nikola Jokic", "2022-23",
+  "23 Nuggets", "Jamal Murray", "2022-23",
+  "23 Nuggets", "Michael Porter Jr.", "2022-23",
+  "23 Nuggets", "Aaron Gordon", "2022-23",
+  "23 Nuggets", "Kentavious Caldwell-Pope", "2022-23",
+  
+  # 2022 Warriors
+  "22 Warriors", "Stephen Curry", "2021-22",
+  "22 Warriors", "Klay Thompson", "2021-22",
+  "22 Warriors", "Draymond Green", "2021-22",
+  "22 Warriors", "Andrew Wiggins", "2021-22",
+  "22 Warriors", "Kevon Looney", "2021-22",
+  
+  # 2021 Bucks
+  "21 Bucks", "P.J. Tucker", "2020-21",
+  "21 Bucks", "Brook Lopez", "2020-21",
+  "21 Bucks", "Jrue Holiday", "2020-21",
+  "21 Bucks", "Khris Middleton", "2020-21",
+  "21 Bucks", "Giannis Antetokounmpo", "2020-21",
+  
+  # 2020 Lakers
+  "20 Lakers", "LeBron James", "2019-20",
+  "20 Lakers", "JaVale McGee", "2019-20",
+  "20 Lakers", "Danny Green", "2019-20",
+  "20 Lakers", "Anthony Davis", "2019-20",
+  "20 Lakers", "Kentavious Caldwell-Pope", "2019-20",
+  
+  # 2019 Raptors
+  "19 Raptors", "Kyle Lowry", "2018-19",
+  "19 Raptors", "Marc Gasol", "2018-19",
+  "19 Raptors", "Danny Green", "2018-19",
+  "19 Raptors", "Kawhi Leonard", "2018-19",
+  "19 Raptors", "Pascal Siakam", "2018-19",
+  
+  # 2018 Warriors
+  "18 Warriors", "Andre Iguodala", "2017-18",
+  "18 Warriors", "Kevin Durant", "2017-18",
+  "18 Warriors", "Stephen Curry", "2017-18",
+  "18 Warriors", "Klay Thompson", "2017-18",
+  "18 Warriors", "Draymond Green", "2017-18",
+  
+  # 2017 Cavs
+  "17 Cavs", "LeBron James", "2016-17",
+  "17 Cavs", "JR Smith", "2016-17",
+  "17 Cavs", "Kevin Love", "2016-17",
+  "17 Cavs", "Kyrie Irving", "2016-17",
+  "17 Cavs", "Tristan Thompson", "2016-17",
+  
+  # 2016 Warriors
+  "16 Warriors", "Andre Iguodala", "2015-16",
+  "16 Warriors", "Stephen Curry", "2015-16",
+  "16 Warriors", "Klay Thompson", "2015-16",
+  "16 Warriors", "Harrison Barnes", "2015-16",
+  "16 Warriors", "Draymond Green", "2015-16"
+)
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# Step 1: Add last names to each player
+lineup_archetypes_labeled <- championship_lineups %>%
+  left_join(df_with_clusters_named, by = c("PLAYER_NAME", "SEASON")) %>%
+  mutate(
+    LAST_NAME = word(PLAYER_NAME, -1),  # Extract last name
+      LAST_NAME = case_when(
+        PLAYER_NAME == "Kentavious Caldwell-Pope" ~ "C-Pope",
+        PLAYER_NAME == "Michael Porter Jr." ~ "Porter Jr.",
+        PLAYER_NAME == "Giannis Antetokounmpo" ~ "Giannis",
+        TRUE ~ LAST_NAME
+      )
+  )
+
+# Step 2: Plot
+ggplot(lineup_archetypes_labeled, aes(x = TEAM, fill = ARCHETYPE)) +
+  geom_bar(position = "stack", stat = "identity", aes(y = 1)) +  # One bar per player
+  geom_text(aes(y = 1, label = LAST_NAME), 
+            position = position_stack(vjust = 0.5), 
+            size = 3, color = "white") +
+  coord_flip() +
+  labs(
+    title = "Breakdown of Most-Used Lineups (Past Champions)",
+    x = "Team",
+    y = "Number of Players",
+    fill = "Archetype"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tibble)
+
+# Define All-NBA First Teams data
+all_nba_first_teams <- tribble(
+  ~TEAM,                  ~PLAYER_NAME,               ~SEASON,
+  "23-24 ",     "Giannis Antetokounmpo",    "2023-24",
+  "23-24 ",     "Luka Doncic",              "2023-24",
+  "23-24 ",     "Shai Gilgeous-Alexander",  "2023-24",
+  "23-24 ",     "Nikola Jokic",             "2023-24",
+  "23-24 ",     "Jayson Tatum",             "2023-24",
+
+  "22-23 ",     "Giannis Antetokounmpo",    "2022-23",
+  "22-23 ",     "Jayson Tatum",             "2022-23",
+  "22-23 ",     "Joel Embiid",              "2022-23",
+  "22-23 ",     "Shai Gilgeous-Alexander",  "2022-23",
+  "22-23 ",     "Luka Doncic",              "2022-23",
+
+  "21-22 ",     "Giannis Antetokounmpo",    "2021-22",
+  "21-22 ",     "Jayson Tatum",             "2021-22",
+  "21-22 ",     "Nikola Jokic",             "2021-22",
+  "21-22 ",     "Devin Booker",             "2021-22",
+  "21-22 ",     "Luka Doncic",              "2021-22",
+
+  "20-21 ",     "Giannis Antetokounmpo",    "2020-21",
+  "20-21 ",     "Kawhi Leonard",            "2020-21",
+  "20-21 ",     "Nikola Jokic",             "2020-21",
+  "20-21 ",     "Stephen Curry",            "2020-21",
+  "20-21 ",     "Luka Doncic",              "2020-21",
+
+  "19-20 ",     "Giannis Antetokounmpo",    "2019-20",
+  "19-20 ",     "LeBron James",             "2019-20",
+  "19-20 ",     "Anthony Davis",            "2019-20",
+  "19-20 ",     "James Harden",             "2019-20",
+  "19-20 ",     "Luka Doncic",              "2019-20",
+
+  "18-19 ",     "Giannis Antetokounmpo",    "2018-19",
+  "18-19 ",     "Paul George",              "2018-19",
+  "18-19 ",     "Nikola Jokic",             "2018-19",
+  "18-19 ",     "James Harden",             "2018-19",
+  "18-19 ",     "Stephen Curry",            "2018-19",
+
+  "17-18 ",     "Kevin Durant",             "2017-18",
+  "17-18 ",     "LeBron James",             "2017-18",
+  "17-18 ",     "Anthony Davis",            "2017-18",
+  "17-18 ",     "James Harden",             "2017-18",
+  "17-18 ",     "Damian Lillard",           "2017-18",
+
+  "16-17 ",     "Kawhi Leonard",            "2016-17",
+  "16-17 ",     "LeBron James",             "2016-17",
+  "16-17 ",     "Anthony Davis",            "2016-17",
+  "16-17 ",     "James Harden",             "2016-17",
+  "16-17 ",     "Russell Westbrook",        "2016-17",
+
+  "15-16 ",     "Kawhi Leonard",            "2015-16",
+  "15-16 ",     "LeBron James",             "2015-16",
+  "15-16 ",     "DeAndre Jordan",           "2015-16",
+  "15-16 ",     "Stephen Curry",            "2015-16",
+  "15-16 ",     "Russell Westbrook",        "2015-16"
+)
+
+# Annotate with archetypes and last names
+all_nba_labeled <- all_nba_first_teams %>%
+  left_join(df_with_clusters_named, by = c("PLAYER_NAME","SEASON")) %>%
+  mutate(
+    LAST_NAME = word(PLAYER_NAME, -1),
+    LAST_NAME = case_when(
+      PLAYER_NAME == "Giannis Antetokounmpo" ~ "Giannis",
+      PLAYER_NAME == "Shai Gilgeous-Alexander" ~ "SGA",
+      TRUE ~ LAST_NAME
+    ),
+    ARCHETYPE = if_else(PLAYER_NAME == "Luka Doncic", "Shot Creator", ARCHETYPE)
+  )
+
+# Plot horizontal stacked bar chart with last name labels
+ggplot(all_nba_labeled, aes(x = TEAM, fill = ARCHETYPE)) +
+  geom_bar(stat = "identity", aes(y = 1), position = "stack", width = 0.7) +
+  geom_text(aes(y = 1, label = LAST_NAME),
+            position = position_stack(vjust = 0.5),
+            size = 3, color = "white") +
+  coord_flip() +
+  labs(
+    title = "",
+    x = "Season All-NBA First Team",
+    y = "Number of Players",
+    fill = "Archetype"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+
+```
+
+
+
+
+# Initial K-Means Clustering (Just Play Types)
+```{r}
+library(dplyr)
+
+# Select only numeric columns to cluster on
+df_numeric <- df_wide %>%
+  select(where(is.numeric)) %>%
+  select(-PLAYER_ID)  # remove identifier columns if needed
+
+# Save player-season info to merge back later
+player_info <- df_wide %>%
+  select(SEASON, PLAYER_NAME, PLAYER_ID)
+
+# If NA, use mean of that column (Mess with this !!)
+df_numeric_clean <- df_numeric %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.), ., mean(., na.rm = TRUE))))
+
+# Normalize the numeric values
+df_scaled <- scale(df_numeric_clean)
+```
+
+
+```{r}
+set.seed(42)  # for reproducibility
+k <- 8
+kmeans_result <- kmeans(df_scaled, centers = k, nstart = 25)
+```
+
+```{r}
+df_archetypes <- bind_cols(player_info, as.data.frame(df_scaled)) %>%
+  mutate(Archetype = as.factor(kmeans_result$cluster))
+```
+
+```{r}
+df_archetypes %>%
+  count(Archetype) %>%
+  arrange(desc(n))
+
+```
+
+```{r}
+df_archetypes %>%
+  select(SEASON, PLAYER_NAME, Archetype) %>%
+  arrange(Archetype, SEASON, PLAYER_NAME)
+
+```
+
+```{r}
+df_archetypes %>%
+  group_by(Archetype) %>%
+  summarise(Players = paste0(unique(PLAYER_NAME), collapse = ", "), .groups = "drop")
+
+```
+
